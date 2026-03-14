@@ -99,6 +99,7 @@ pub fn make_sure_egl_is_loaded() -> Result<Vec<String>, Error> {
         egl::UnbindWaylandDisplayWL::load_with(&proc_address);
         egl::QueryWaylandBufferWL::load_with(&proc_address);
         egl::DebugMessageControlKHR::load_with(&proc_address);
+        egl::GetNativeClientBufferANDROID::load_with(&proc_address);
     });
 
     let extensions = unsafe {
@@ -255,6 +256,10 @@ pub mod egl {
             f: super::missing_fn_panic as *const raw::c_void,
             is_loaded: false,
         };
+        pub static mut GetNativeClientBufferANDROID: FnPtr = FnPtr {
+            f: super::missing_fn_panic as *const raw::c_void,
+            is_loaded: false,
+        };
     }
 
     #[allow(non_snake_case)]
@@ -359,6 +364,47 @@ pub mod egl {
     // Accepted in the <attribute> parameter of eglQueryWaylandBufferWL:
     pub const EGL_TEXTURE_FORMAT: i32 = 0x3080;
     pub const WAYLAND_Y_INVERTED_WL: i32 = 0x31DB;
+
+    /*
+     * Android AHardwareBuffer import via EGL_ANDROID_get_native_client_buffer
+     * and EGL_ANDROID_image_native_buffer extensions.
+     */
+
+    // Accepted as <target> in eglCreateImageKHR (from EGL_ANDROID_image_native_buffer)
+    pub const NATIVE_BUFFER_ANDROID: c_uint = 0x3140;
+
+    #[allow(non_snake_case, unused_variables, dead_code)]
+    #[inline]
+    pub unsafe fn GetNativeClientBufferANDROID(
+        buffer: *const __gl_imports::raw::c_void,
+    ) -> *const __gl_imports::raw::c_void {
+        __gl_imports::mem::transmute::<
+            _,
+            extern "system" fn(*const __gl_imports::raw::c_void) -> *const __gl_imports::raw::c_void,
+        >(wayland_storage::GetNativeClientBufferANDROID.f)(buffer)
+    }
+
+    #[allow(non_snake_case)]
+    pub mod GetNativeClientBufferANDROID {
+        use super::{FnPtr, __gl_imports::raw, metaloadfn, wayland_storage};
+
+        #[inline]
+        #[allow(dead_code)]
+        pub fn is_loaded() -> bool {
+            unsafe { wayland_storage::GetNativeClientBufferANDROID.is_loaded }
+        }
+
+        #[allow(dead_code)]
+        pub fn load_with<F>(mut loadfn: F)
+        where
+            F: FnMut(&str) -> *const raw::c_void,
+        {
+            unsafe {
+                wayland_storage::GetNativeClientBufferANDROID =
+                    FnPtr::new(metaloadfn(&mut loadfn, "eglGetNativeClientBufferANDROID", &[]))
+            }
+        }
+    }
 
     pub const PLATFORM_ANGLE_ANGLE: u32 = 0x3202;
     pub const PLATFORM_ANGLE_TYPE_ANGLE: i32 = 0x3203;

@@ -37,6 +37,7 @@ impl GlesTexture {
             size,
             egl_images: None,
             destruction_callback_sender: renderer.gles_cleanup().sender.clone(),
+            ahb_handle: None,
         }))
     }
 
@@ -130,6 +131,8 @@ pub(super) struct GlesTextureInternal {
     pub(super) y_inverted: bool,
     pub(super) size: Size<i32, BufferCoord>,
     pub(super) egl_images: Option<Vec<EGLImage>>,
+    /// AHardwareBuffer handle for Android zero-copy dmabuf import. Must outlive egl_images.
+    pub(super) ahb_handle: Option<*mut std::ffi::c_void>,
     pub(super) destruction_callback_sender: Sender<CleanupResource>,
 }
 unsafe impl Send for GlesTextureInternal {}
@@ -157,6 +160,12 @@ impl Drop for GlesTextureInternal {
                     .destruction_callback_sender
                     .send(CleanupResource::EGLImage(image));
             }
+        }
+        // AHB must be released after EGLImage (EGLImage references the AHB's buffer).
+        if let Some(ahb) = self.ahb_handle.take() {
+            let _ = self
+                .destruction_callback_sender
+                .send(CleanupResource::AHardwareBuffer(ahb));
         }
     }
 }

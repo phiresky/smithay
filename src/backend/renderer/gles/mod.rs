@@ -83,6 +83,7 @@ enum CleanupResource {
     Mapping(ffi::types::GLuint, *const std::ffi::c_void),
     Program(ffi::types::GLuint),
     Sync(ffi::types::GLsync),
+    AHardwareBuffer(*mut std::ffi::c_void),
 }
 unsafe impl Send for CleanupResource {}
 
@@ -360,6 +361,16 @@ impl GlesCleanup {
                 },
                 CleanupResource::Sync(sync) => unsafe {
                     gl.DeleteSync(sync);
+                },
+                CleanupResource::AHardwareBuffer(ahb) => {
+                    #[cfg(target_os = "android")]
+                    {
+                        if let Some(release) = ahb_functions().and_then(|f| Some(f.release)) {
+                            unsafe { release(ahb) };
+                        }
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    { let _ = ahb; }
                 },
             }
         }
@@ -920,6 +931,7 @@ impl ImportMemWl for GlesRenderer {
                             y_inverted: false,
                             size: (width, height).into(),
                             egl_images: None,
+                            ahb_handle: None,
                             destruction_callback_sender: self.gles_cleanup().sender.clone(),
                         });
                         if let Some(cache) = surface_lock.as_mut() {
@@ -1089,6 +1101,7 @@ impl ImportMem for GlesRenderer {
                 y_inverted: flipped,
                 size,
                 egl_images: None,
+                ahb_handle: None,
                 destruction_callback_sender: self.gles_cleanup().sender.clone(),
             }
         }));
@@ -1234,12 +1247,106 @@ impl ImportEgl for GlesRenderer {
             y_inverted: egl.y_inverted,
             size: egl.size,
             egl_images: Some(egl.into_images()),
+            ahb_handle: None,
             destruction_callback_sender: self.gles_cleanup().sender.clone(),
         }));
 
         Ok(texture)
     }
 }
+
+// --- Android AHardwareBuffer zero-copy dmabuf import ---
+
+#[cfg(target_os = "android")]
+mod android_ahb {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+    use crate::backend::allocator::Fourcc;
+
+    /// native_handle_t from Android NDK (variable-length, we use fixed size for single-plane)
+    #[repr(C)]
+    pub struct NativeHandle {
+        pub version: i32,        // sizeof(native_handle_t) header = 12
+        pub num_fds: i32,
+        pub num_ints: i32,
+        pub data: [i32; 4],      // fds first, then ints
+    }
+
+    /// AHardwareBuffer_Desc from Android NDK
+    #[repr(C)]
+    pub struct AHardwareBufferDesc {
+        pub width: u32,
+        pub height: u32,
+        pub layers: u32,
+        pub format: u32,
+        pub usage: u64,
+        pub stride: u32,
+        pub rfu0: u32,
+        pub rfu1: u64,
+    }
+
+    // AHardwareBuffer format constants (= HAL_PIXEL_FORMAT_*)
+    pub const AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM: u32 = 1;  // RGBA
+    pub const AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM: u32 = 2;  // RGBX
+    pub const AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM: u32 = 3;    // RGB
+    pub const AHARDWAREBUFFER_FORMAT_BGRA_8888: u32 = 5;       // HAL_PIXEL_FORMAT_BGRA_8888
+
+    // AHardwareBuffer usage flags
+    pub const AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE: u64 = 1 << 8;
+
+    // createFromHandle method constants (GraphicBuffer::HandleWrapMethod)
+    pub const AHARDWAREBUFFER_CREATE_FROM_HANDLE_METHOD_CLONE: i32 = 0;  // clone/dup the handle
+
+    pub type CreateFromHandleFn = unsafe extern "C" fn(
+        desc: *const AHardwareBufferDesc,
+        handle: *const NativeHandle,
+        method: i32,
+        out: *mut *mut c_void,
+    ) -> i32;
+
+    pub type ReleaseFn = unsafe extern "C" fn(buffer: *mut c_void);
+
+    pub struct AhbFunctions {
+        pub create_from_handle: CreateFromHandleFn,
+        pub release: ReleaseFn,
+    }
+
+    static AHB_FUNCTIONS: OnceLock<Option<AhbFunctions>> = OnceLock::new();
+
+    pub fn ahb_functions() -> Option<&'static AhbFunctions> {
+        AHB_FUNCTIONS.get_or_init(|| {
+            let lib = unsafe { libloading::Library::new("libnativewindow.so") }.ok()?;
+            let create_from_handle: libloading::Symbol<CreateFromHandleFn> =
+                unsafe { lib.get(b"AHardwareBuffer_createFromHandle") }.ok()?;
+            let release: libloading::Symbol<ReleaseFn> =
+                unsafe { lib.get(b"AHardwareBuffer_release") }.ok()?;
+            let funcs = AhbFunctions {
+                create_from_handle: *create_from_handle,
+                release: *release,
+            };
+            // Leak the library so function pointers remain valid
+            std::mem::forget(lib);
+            tracing::info!("AHardwareBuffer functions loaded from libnativewindow.so");
+            Some(funcs)
+        }).as_ref()
+    }
+
+    /// Map DRM fourcc to AHardwareBuffer format.
+    /// DRM fourcc names describe memory byte order; AHB uses channel order.
+    /// Fourcc::Abgr8888 = memory bytes R,G,B,A = AHB R8G8B8A8_UNORM
+    pub fn fourcc_to_ahb_format(fourcc: Fourcc) -> Option<u32> {
+        match fourcc {
+            Fourcc::Abgr8888 => Some(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM),
+            Fourcc::Xbgr8888 => Some(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM),
+            // Argb8888/Xrgb8888: memory [B,G,R,A/X] = BGRA layout
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 => Some(AHARDWAREBUFFER_FORMAT_BGRA_8888),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+use android_ahb::ahb_functions;
 
 impl ImportDma for GlesRenderer {
     #[instrument(level = "trace", parent = &self.span, skip(self))]
@@ -1277,14 +1384,24 @@ impl ImportDma for GlesRenderer {
                         y_inverted: buffer.y_inverted(),
                         size: buffer.size(),
                         egl_images: Some(vec![image]),
+                        ahb_handle: None,
                         destruction_callback_sender: self.gles_cleanup().sender.clone(),
                     }));
                     self.dmabuf_cache.insert(buffer.weak(), texture.clone());
                     Ok(texture)
                 }
                 Err(_egl_err) => {
-                    // Fallback: mmap the dmabuf fd and upload pixels via glTexSubImage2D.
-                    // This is the Android path where EGL lacks EGL_EXT_image_dma_buf_import.
+                    // EGLImage dmabuf import failed. Try platform-specific fallbacks.
+                    #[cfg(target_os = "android")]
+                    {
+                        match self.import_dmabuf_via_ahb(buffer) {
+                            Ok(tex) => return Ok(tex),
+                            Err(ahb_err) => {
+                                warn!("AHardwareBuffer import failed: {ahb_err}, falling back to mmap");
+                            }
+                        }
+                    }
+                    // Final fallback: mmap + glTexSubImage2D (CPU copy).
                     self.import_dmabuf_via_mmap(buffer)
                 }
             }
@@ -1319,6 +1436,125 @@ impl GlesRenderer {
             self.import_egl_image(egl_images[0], texture.0.is_external, tex)?;
         }
         Ok(Some(texture.clone()))
+    }
+
+    /// Fallback dmabuf import: mmap the fd and upload pixels via glTexSubImage2D.
+    /// Used on Android where EGL lacks EGL_EXT_image_dma_buf_import.
+    /// Zero-copy dmabuf import via AHardwareBuffer on Android.
+    /// Creates an AHB from the dmabuf fd, then imports it as an EGLImage.
+    #[cfg(target_os = "android")]
+    fn import_dmabuf_via_ahb(&mut self, buffer: &Dmabuf) -> Result<GlesTexture, GlesError> {
+        use crate::backend::allocator::Buffer;
+        use std::os::unix::io::AsRawFd;
+        use android_ahb::*;
+
+        let funcs = ahb_functions()
+            .ok_or(GlesError::MappingError)?;
+
+        let size = buffer.size();
+        let fourcc = buffer.format().code;
+
+        // Only single-plane linear buffers for now
+        if buffer.num_planes() != 1 {
+            return Err(GlesError::MappingError);
+        }
+
+        let ahb_format = fourcc_to_ahb_format(fourcc)
+            .ok_or(GlesError::UnsupportedPixelFormat(fourcc))?;
+
+        let fd = buffer.handles().next()
+            .ok_or(GlesError::UnknownPixelFormat)?;
+        let stride = buffer.strides().next()
+            .ok_or(GlesError::UnknownPixelFormat)?;
+        let bpp: u32 = 4; // 32-bit RGBA/RGBX formats
+
+        // Build native_handle_t with the dmabuf fd
+        let handle = NativeHandle {
+            version: 12, // sizeof(native_handle_t) header
+            num_fds: 1,
+            num_ints: 0,
+            data: [fd.as_raw_fd(), 0, 0, 0],
+        };
+
+        let desc = AHardwareBufferDesc {
+            width: size.w as u32,
+            height: size.h as u32,
+            layers: 1,
+            format: ahb_format,
+            usage: AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+            stride: stride / bpp, // AHB stride is in pixels
+            rfu0: 0,
+            rfu1: 0,
+        };
+
+        // Create AHardwareBuffer from the dmabuf fd
+        let mut ahb: *mut std::ffi::c_void = std::ptr::null_mut();
+        let ret = unsafe {
+            (funcs.create_from_handle)(
+                &desc,
+                &handle,
+                AHARDWAREBUFFER_CREATE_FROM_HANDLE_METHOD_CLONE,
+                &mut ahb,
+            )
+        };
+        if ret != 0 || ahb.is_null() {
+            warn!("AHardwareBuffer_createFromHandle failed: ret={ret}");
+            return Err(GlesError::MappingError);
+        }
+
+        // Convert AHB to EGLClientBuffer
+        if !ffi_egl::GetNativeClientBufferANDROID::is_loaded() {
+            unsafe { (funcs.release)(ahb); }
+            return Err(GlesError::MappingError);
+        }
+        let client_buffer = unsafe { ffi_egl::GetNativeClientBufferANDROID(ahb) };
+        if client_buffer.is_null() {
+            unsafe { (funcs.release)(ahb); }
+            warn!("eglGetNativeClientBufferANDROID returned null");
+            return Err(GlesError::MappingError);
+        }
+
+        // Create EGLImage from the native buffer
+        let attribs = [ffi_egl::NONE as i32];
+        let display_handle = self.egl.display().get_display_handle();
+        let image = unsafe {
+            ffi_egl::CreateImageKHR(
+                **display_handle,
+                ffi_egl::NO_CONTEXT,
+                ffi_egl::NATIVE_BUFFER_ANDROID,
+                client_buffer as *mut std::ffi::c_void,
+                attribs.as_ptr(),
+            )
+        };
+        if image == ffi_egl::NO_IMAGE_KHR {
+            unsafe { (funcs.release)(ahb); }
+            warn!("eglCreateImageKHR(NATIVE_BUFFER_ANDROID) failed");
+            return Err(GlesError::MappingError);
+        }
+
+        // Bind EGLImage to GL texture
+        let tex = self.import_egl_image(image, false, None)?;
+
+        let gl_format = fourcc_to_gl_formats(fourcc)
+            .map(|(internal, _, _)| internal)
+            .unwrap_or(ffi::RGBA8);
+        let has_alpha = has_alpha(fourcc);
+
+        let texture = GlesTexture(Arc::new(GlesTextureInternal {
+            texture: tex,
+            sync: RwLock::default(),
+            format: Some(gl_format),
+            has_alpha,
+            is_external: false,
+            y_inverted: buffer.y_inverted(),
+            size,
+            egl_images: Some(vec![image]),
+            ahb_handle: Some(ahb),
+            destruction_callback_sender: self.gles_cleanup().sender.clone(),
+        }));
+        self.dmabuf_cache.insert(buffer.weak(), texture.clone());
+        info!("AHardwareBuffer dmabuf import succeeded ({}x{}, {:?})", size.w, size.h, fourcc);
+        Ok(texture)
     }
 
     /// Fallback dmabuf import: mmap the fd and upload pixels via glTexSubImage2D.
@@ -1404,6 +1640,7 @@ impl GlesRenderer {
                 y_inverted: buffer.y_inverted(),
                 size,
                 egl_images: None,
+                ahb_handle: None,
                 destruction_callback_sender: self.gles_cleanup().sender.clone(),
             })))
         };
