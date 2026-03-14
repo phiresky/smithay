@@ -1256,30 +1256,38 @@ impl ImportDma for GlesRenderer {
 
         self.existing_dmabuf_texture(buffer)?.map(Ok).unwrap_or_else(|| {
             let is_external = !self.egl.dmabuf_render_formats().contains(&buffer.format());
-            let image = self
+            let eglimage_result = self
                 .egl
                 .display()
-                .create_image_from_dmabuf(buffer)
-                .map_err(GlesError::BindBufferEGLError)?;
+                .create_image_from_dmabuf(buffer);
 
-            let tex = self.import_egl_image(image, is_external, None)?;
-            let format = fourcc_to_gl_formats(buffer.format().code)
-                .map(|(internal, _, _)| internal)
-                .unwrap_or(ffi::RGBA8);
-            let has_alpha = has_alpha(buffer.format().code);
-            let texture = GlesTexture(Arc::new(GlesTextureInternal {
-                texture: tex,
-                sync: RwLock::default(),
-                format: Some(format),
-                has_alpha,
-                is_external,
-                y_inverted: buffer.y_inverted(),
-                size: buffer.size(),
-                egl_images: Some(vec![image]),
-                destruction_callback_sender: self.gles_cleanup().sender.clone(),
-            }));
-            self.dmabuf_cache.insert(buffer.weak(), texture.clone());
-            Ok(texture)
+            match eglimage_result {
+                Ok(image) => {
+                    let tex = self.import_egl_image(image, is_external, None)?;
+                    let format = fourcc_to_gl_formats(buffer.format().code)
+                        .map(|(internal, _, _)| internal)
+                        .unwrap_or(ffi::RGBA8);
+                    let has_alpha = has_alpha(buffer.format().code);
+                    let texture = GlesTexture(Arc::new(GlesTextureInternal {
+                        texture: tex,
+                        sync: RwLock::default(),
+                        format: Some(format),
+                        has_alpha,
+                        is_external,
+                        y_inverted: buffer.y_inverted(),
+                        size: buffer.size(),
+                        egl_images: Some(vec![image]),
+                        destruction_callback_sender: self.gles_cleanup().sender.clone(),
+                    }));
+                    self.dmabuf_cache.insert(buffer.weak(), texture.clone());
+                    Ok(texture)
+                }
+                Err(_egl_err) => {
+                    // Fallback: mmap the dmabuf fd and upload pixels via glTexSubImage2D.
+                    // This is the Android path where EGL lacks EGL_EXT_image_dma_buf_import.
+                    self.import_dmabuf_via_mmap(buffer)
+                }
+            }
         })
     }
 
@@ -1311,6 +1319,99 @@ impl GlesRenderer {
             self.import_egl_image(egl_images[0], texture.0.is_external, tex)?;
         }
         Ok(Some(texture.clone()))
+    }
+
+    /// Fallback dmabuf import: mmap the fd and upload pixels via glTexSubImage2D.
+    /// Used on Android where EGL lacks EGL_EXT_image_dma_buf_import.
+    fn import_dmabuf_via_mmap(&mut self, buffer: &Dmabuf) -> Result<GlesTexture, GlesError> {
+        use crate::backend::allocator::Buffer;
+        use std::os::unix::io::AsRawFd;
+
+        let size = buffer.size();
+        let w = size.w;
+        let h = size.h;
+        let fourcc = buffer.format().code;
+
+        let (gl_internal, gl_format, gl_type) = fourcc_to_gl_formats(fourcc)
+            .ok_or(GlesError::UnsupportedPixelFormat(fourcc))?;
+
+        let fd = buffer.handles().next()
+            .ok_or_else(|| GlesError::UnknownPixelFormat)?;
+        let stride = buffer.strides().next()
+            .ok_or_else(|| GlesError::UnknownPixelFormat)? as usize;
+        let offset = buffer.offsets().next()
+            .ok_or_else(|| GlesError::UnknownPixelFormat)? as usize;
+
+        let map_size = offset + stride * (h as usize);
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(GlesError::MappingError);
+        }
+
+        let result = unsafe {
+            self.egl.make_current()?;
+
+            let mut tex = 0u32;
+            self.gl.GenTextures(1, &mut tex);
+            self.gl.BindTexture(ffi::TEXTURE_2D, tex);
+            self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+
+            // Set row stride if it differs from the default (width * bpp)
+            let bpp = 4usize; // 32-bit formats
+            if stride != w as usize * bpp {
+                self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, (stride / bpp) as i32);
+            }
+
+            let pixel_data = (ptr as *const u8).add(offset);
+            self.gl.TexImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                gl_internal as i32,
+                w,
+                h,
+                0,
+                gl_format,
+                gl_type,
+                pixel_data as *const _,
+            );
+
+            if stride != w as usize * bpp {
+                self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, 0);
+            }
+
+            self.gl.BindTexture(ffi::TEXTURE_2D, 0);
+
+            let alpha = has_alpha(fourcc);
+            Ok(GlesTexture(Arc::new(GlesTextureInternal {
+                texture: tex,
+                sync: RwLock::default(),
+                format: Some(gl_internal),
+                has_alpha: alpha,
+                is_external: false,
+                y_inverted: buffer.y_inverted(),
+                size,
+                egl_images: None,
+                destruction_callback_sender: self.gles_cleanup().sender.clone(),
+            })))
+        };
+
+        unsafe { libc::munmap(ptr, map_size); }
+
+        // Don't cache mmap-imported textures — they need re-upload each frame.
+        result
     }
 
     #[profiling::function]

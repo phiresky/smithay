@@ -741,14 +741,22 @@ impl EGLDisplay {
     #[instrument(level = "trace", skip(self), parent = &self.span, err)]
     #[profiling::function]
     pub fn create_image_from_dmabuf(&self, dmabuf: &Dmabuf) -> Result<EGLImage, Error> {
-        if !self.extensions.has_image_base && !self.extensions.has_import_dmabuf {
+        if !self.extensions.has_image_base {
             return Err(Error::EglExtensionNotSupported(&[
                 "EGL_KHR_image_base",
-                "EGL_EXT_image_dma_buf_import",
             ]));
         }
 
-        if dmabuf.has_modifier() && !self.extensions.has_import_dmabuf_modifiers {
+        // Note: we don't check has_import_dmabuf here — Android EGL may support
+        // EGL_LINUX_DMA_BUF_EXT target without advertising the extension string.
+        // Let eglCreateImageKHR fail naturally if unsupported.
+
+        // Treat non-LINEAR modifiers as unsupported if modifiers extension is absent,
+        // but allow LINEAR/Invalid through (they don't need modifier attributes).
+        if dmabuf.has_modifier()
+            && !self.extensions.has_import_dmabuf_modifiers
+            && dmabuf.format().modifier != drm_fourcc::DrmModifier::Linear
+        {
             return Err(Error::EglExtensionNotSupported(&[
                 "EGL_EXT_image_dma_buf_import_modifiers",
             ]));

@@ -381,6 +381,21 @@ impl FormatSet {
             formats: Arc::new(formats),
         }
     }
+
+    /// Create a FormatSet with common hardcoded formats (ARGB8888, XRGB8888, ABGR8888, XBGR8888)
+    /// with LINEAR modifier. Useful when EGL doesn't advertise dmabuf import support
+    /// but the underlying driver may still handle these formats.
+    pub fn from_formats_hardcoded() -> Self {
+        use super::{Fourcc, Format, Modifier};
+        let mut formats = IndexSet::new();
+        for fourcc in [Fourcc::Argb8888, Fourcc::Xrgb8888, Fourcc::Abgr8888, Fourcc::Xbgr8888] {
+            formats.insert(Format { code: fourcc, modifier: Modifier::Linear });
+            formats.insert(Format { code: fourcc, modifier: Modifier::Invalid });
+        }
+        FormatSet {
+            formats: Arc::new(formats),
+        }
+    }
 }
 
 impl FormatSet {
