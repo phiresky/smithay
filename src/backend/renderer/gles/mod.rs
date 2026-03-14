@@ -1345,6 +1345,57 @@ mod android_ahb {
     }
 }
 
+// --- GL_EXT_memory_object_fd zero-copy dmabuf import ---
+
+mod gl_memory_object {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    // GL constants from GL_EXT_memory_object / GL_EXT_memory_object_fd
+    pub const HANDLE_TYPE_OPAQUE_FD_EXT: u32 = 0x9586;
+    pub const HANDLE_TYPE_DMA_BUF_FD_EXT: u32 = 0x9587;
+
+    type CreateMemoryObjectsFn = unsafe extern "system" fn(n: i32, objects: *mut u32);
+    type DeleteMemoryObjectsFn = unsafe extern "system" fn(n: i32, objects: *const u32);
+    type ImportMemoryFdFn = unsafe extern "system" fn(memory: u32, size: u64, handle_type: u32, fd: i32);
+    type TexStorageMem2DFn = unsafe extern "system" fn(target: u32, levels: i32, internal_format: u32, w: i32, h: i32, memory: u32, offset: u64);
+
+    pub struct MemObjFunctions {
+        pub create: CreateMemoryObjectsFn,
+        pub delete: DeleteMemoryObjectsFn,
+        pub import_fd: ImportMemoryFdFn,
+        pub tex_storage_mem_2d: TexStorageMem2DFn,
+    }
+
+    static MEMOBJ_FUNCTIONS: OnceLock<Option<MemObjFunctions>> = OnceLock::new();
+
+    pub fn memobj_functions() -> Option<&'static MemObjFunctions> {
+        MEMOBJ_FUNCTIONS.get_or_init(|| {
+            let get = |name: &str| -> *const c_void {
+                unsafe { crate::backend::egl::get_proc_address(name) }
+            };
+
+            let create = get("glCreateMemoryObjectsEXT");
+            let delete = get("glDeleteMemoryObjectsEXT");
+            let import_fd = get("glImportMemoryFdEXT");
+            let tex_storage = get("glTexStorageMem2DEXT");
+
+            if create.is_null() || delete.is_null() || import_fd.is_null() || tex_storage.is_null() {
+                tracing::info!("GL_EXT_memory_object_fd functions not available");
+                return None;
+            }
+
+            tracing::info!("GL_EXT_memory_object_fd functions loaded");
+            Some(MemObjFunctions {
+                create: unsafe { std::mem::transmute(create) },
+                delete: unsafe { std::mem::transmute(delete) },
+                import_fd: unsafe { std::mem::transmute(import_fd) },
+                tex_storage_mem_2d: unsafe { std::mem::transmute(tex_storage) },
+            })
+        }).as_ref()
+    }
+}
+
 #[cfg(target_os = "android")]
 use android_ahb::ahb_functions;
 
@@ -1401,6 +1452,10 @@ impl ImportDma for GlesRenderer {
                             }
                         }
                     }
+                    // GL_EXT_memory_object_fd: DMA_BUF import succeeds but
+                    // glTexStorageMem2DEXT fails on Qualcomm (GL_INVALID_VALUE).
+                    // Disabled for now — see import_dmabuf_via_memory_object().
+                    //
                     // Final fallback: mmap + glTexSubImage2D (CPU copy).
                     self.import_dmabuf_via_mmap(buffer)
                 }
@@ -1440,6 +1495,128 @@ impl GlesRenderer {
 
     /// Fallback dmabuf import: mmap the fd and upload pixels via glTexSubImage2D.
     /// Used on Android where EGL lacks EGL_EXT_image_dma_buf_import.
+    /// Zero-copy dmabuf import via GL_EXT_memory_object_fd.
+    /// Imports the dmabuf fd directly as a GL memory object and binds it to a texture.
+    fn import_dmabuf_via_memory_object(&mut self, buffer: &Dmabuf) -> Result<GlesTexture, GlesError> {
+        use crate::backend::allocator::Buffer;
+        use std::os::unix::io::AsRawFd;
+        use gl_memory_object::*;
+
+        let funcs = memobj_functions()
+            .ok_or(GlesError::MappingError)?;
+
+        if !self.extensions.iter().any(|e| e == "GL_EXT_memory_object_fd") {
+            return Err(GlesError::GLExtensionNotSupported(&["GL_EXT_memory_object_fd"]));
+        }
+
+        let size = buffer.size();
+        let w = size.w;
+        let h = size.h;
+        let fourcc = buffer.format().code;
+
+        if buffer.num_planes() != 1 {
+            warn!("GL memobj: num_planes={}, need 1", buffer.num_planes());
+            return Err(GlesError::MappingError);
+        }
+
+        // glTexStorageMem2DEXT requires a sized internal format (GL_RGBA8),
+        // not an unsized/transfer format like GL_BGRA_EXT.
+        let gl_internal = ffi::RGBA8;
+
+        let fd = buffer.handles().next()
+            .ok_or(GlesError::UnknownPixelFormat)?;
+        let stride = buffer.strides().next()
+            .ok_or(GlesError::UnknownPixelFormat)? as usize;
+        let offset = buffer.offsets().next()
+            .ok_or(GlesError::UnknownPixelFormat)? as u64;
+
+        // Get actual fd size (KGSL page-aligns allocations)
+        let buf_size = unsafe {
+            let end = libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END);
+            libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET);
+            if end <= 0 { (stride * h as usize) as i64 }
+            else { end }
+        } as u64;
+        let modifier = buffer.format().modifier;
+        info!("GL memobj: trying {}x{} {:?} modifier={:?} stride={} offset={} buf_size={} fd={}",
+              w, h, fourcc, modifier, stride, offset, buf_size, fd.as_raw_fd());
+
+        // dup the fd — GL takes ownership
+        let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
+        if dup_fd < 0 {
+            warn!("GL memobj: dup failed");
+            return Err(GlesError::MappingError);
+        }
+
+        unsafe {
+            self.egl.make_current()?;
+
+            // Create memory object
+            let mut mem_obj: u32 = 0;
+            (funcs.create)(1, &mut mem_obj);
+
+            // Try DMA_BUF_FD first (correct type for dmabufs), then OPAQUE_FD
+            (funcs.import_fd)(mem_obj, buf_size, HANDLE_TYPE_DMA_BUF_FD_EXT, dup_fd);
+            let err = self.gl.GetError();
+            if err != ffi::NO_ERROR {
+                info!("GL memobj: DMA_BUF_FD import err={:#x}, trying OPAQUE_FD", err);
+                let dup_fd2 = libc::dup(fd.as_raw_fd());
+                if dup_fd2 >= 0 {
+                    (funcs.import_fd)(mem_obj, buf_size, HANDLE_TYPE_OPAQUE_FD_EXT, dup_fd2);
+                    let err2 = self.gl.GetError();
+                    if err2 != ffi::NO_ERROR {
+                        (funcs.delete)(1, &mem_obj);
+                        warn!("GL memory object import failed (DMA_BUF err={:#x}, OPAQUE err={:#x})", err, err2);
+                        return Err(GlesError::MappingError);
+                    }
+                } else {
+                    (funcs.delete)(1, &mem_obj);
+                    return Err(GlesError::MappingError);
+                }
+            } else {
+                info!("GL memobj: DMA_BUF_FD import succeeded");
+            }
+
+            // Create texture and bind memory object to it
+            let mut tex: u32 = 0;
+            self.gl.GenTextures(1, &mut tex);
+            self.gl.BindTexture(ffi::TEXTURE_2D, tex);
+            self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+
+            (funcs.tex_storage_mem_2d)(ffi::TEXTURE_2D, 1, gl_internal, w, h, mem_obj, offset);
+            let tex_err = self.gl.GetError();
+            if tex_err != ffi::NO_ERROR {
+                self.gl.DeleteTextures(1, &tex);
+                (funcs.delete)(1, &mem_obj);
+                warn!("glTexStorageMem2DEXT failed: err={:#x}", tex_err);
+                return Err(GlesError::MappingError);
+            }
+
+            self.gl.BindTexture(ffi::TEXTURE_2D, 0);
+
+            let has_alpha = has_alpha(fourcc);
+            let texture = GlesTexture(Arc::new(GlesTextureInternal {
+                texture: tex,
+                sync: RwLock::default(),
+                format: Some(gl_internal),
+                has_alpha,
+                is_external: false,
+                y_inverted: buffer.y_inverted(),
+                size,
+                egl_images: None,
+                ahb_handle: None,
+                destruction_callback_sender: self.gles_cleanup().sender.clone(),
+            }));
+            // TODO: mem_obj cleanup — for now it leaks (texture holds ref to it)
+            self.dmabuf_cache.insert(buffer.weak(), texture.clone());
+            info!("GL memory object dmabuf import succeeded ({}x{}, {:?})", w, h, fourcc);
+            Ok(texture)
+        }
+    }
+
     /// Zero-copy dmabuf import via AHardwareBuffer on Android.
     /// Creates an AHB from the dmabuf fd, then imports it as an EGLImage.
     #[cfg(target_os = "android")]
