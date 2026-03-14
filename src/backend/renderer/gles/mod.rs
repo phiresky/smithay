@@ -1353,18 +1353,24 @@ mod gl_memory_object {
 
     // GL constants from GL_EXT_memory_object / GL_EXT_memory_object_fd
     pub const HANDLE_TYPE_OPAQUE_FD_EXT: u32 = 0x9586;
-    pub const HANDLE_TYPE_DMA_BUF_FD_EXT: u32 = 0x9587;
 
     type CreateMemoryObjectsFn = unsafe extern "system" fn(n: i32, objects: *mut u32);
     type DeleteMemoryObjectsFn = unsafe extern "system" fn(n: i32, objects: *const u32);
     type ImportMemoryFdFn = unsafe extern "system" fn(memory: u32, size: u64, handle_type: u32, fd: i32);
     type TexStorageMem2DFn = unsafe extern "system" fn(target: u32, levels: i32, internal_format: u32, w: i32, h: i32, memory: u32, offset: u64);
+    type MemObjParamFn = unsafe extern "system" fn(memory: u32, pname: u32, params: *const i32);
+    type IsMemObjFn = unsafe extern "system" fn(memory: u32) -> u8;
+
+    // GL_EXT_memory_object constants
+    pub const DEDICATED_MEMORY_OBJECT_EXT: u32 = 0x9581;
 
     pub struct MemObjFunctions {
         pub create: CreateMemoryObjectsFn,
         pub delete: DeleteMemoryObjectsFn,
         pub import_fd: ImportMemoryFdFn,
         pub tex_storage_mem_2d: TexStorageMem2DFn,
+        pub mem_obj_param: Option<MemObjParamFn>,
+        pub is_mem_obj: Option<IsMemObjFn>,
     }
 
     static MEMOBJ_FUNCTIONS: OnceLock<Option<MemObjFunctions>> = OnceLock::new();
@@ -1385,14 +1391,285 @@ mod gl_memory_object {
                 return None;
             }
 
-            tracing::info!("GL_EXT_memory_object_fd functions loaded");
+            let param = get("glMemoryObjectParameterivEXT");
+            let is_obj = get("glIsMemoryObjectEXT");
+
+            tracing::info!("GL_EXT_memory_object_fd functions loaded (param={}, isObj={})",
+                !param.is_null(), !is_obj.is_null());
             Some(MemObjFunctions {
                 create: unsafe { std::mem::transmute(create) },
                 delete: unsafe { std::mem::transmute(delete) },
                 import_fd: unsafe { std::mem::transmute(import_fd) },
                 tex_storage_mem_2d: unsafe { std::mem::transmute(tex_storage) },
+                mem_obj_param: if param.is_null() { None } else { Some(unsafe { std::mem::transmute(param) }) },
+                is_mem_obj: if is_obj.is_null() { None } else { Some(unsafe { std::mem::transmute(is_obj) }) },
             })
         }).as_ref()
+    }
+}
+
+// --- Vulkan bridge: convert KGSL dmabuf fd → opaque fd via proprietary Vulkan ---
+
+#[cfg(target_os = "android")]
+mod vulkan_bridge {
+    use std::ffi::{c_void, c_char, CString};
+    use std::sync::OnceLock;
+
+    // Vulkan handle types (opaque pointers)
+    type VkInstance = *mut c_void;
+    type VkPhysicalDevice = *mut c_void;
+    type VkDevice = *mut c_void;
+    type VkDeviceMemory = u64; // non-dispatchable handle
+
+    // Vulkan constants
+    const VK_SUCCESS: i32 = 0;
+    const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
+    const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
+    const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
+    const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
+    const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
+    const VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR: u32 = 1000074000;
+    const VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR: u32 = 1000074001;
+    const VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR: u32 = 1000074002;
+    const VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO: u32 = 1000072002;
+    const VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT: u32 = 0x1;
+    const VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT: u32 = 0x200;
+    const VK_API_VERSION_1_1: u32 = (1 << 22) | (1 << 12);
+
+    // Minimal Vulkan structures (repr C, only fields we use)
+    #[repr(C)]
+    struct VkApplicationInfo {
+        s_type: u32, p_next: *const c_void,
+        p_app_name: *const c_char, app_version: u32,
+        p_engine_name: *const c_char, engine_version: u32,
+        api_version: u32,
+    }
+    #[repr(C)]
+    struct VkInstanceCreateInfo {
+        s_type: u32, p_next: *const c_void, flags: u32,
+        p_app_info: *const VkApplicationInfo,
+        enabled_layer_count: u32, pp_enabled_layer_names: *const *const c_char,
+        enabled_ext_count: u32, pp_enabled_ext_names: *const *const c_char,
+    }
+    #[repr(C)]
+    struct VkDeviceQueueCreateInfo {
+        s_type: u32, p_next: *const c_void, flags: u32,
+        queue_family_index: u32, queue_count: u32,
+        p_queue_priorities: *const f32,
+    }
+    #[repr(C)]
+    struct VkDeviceCreateInfo {
+        s_type: u32, p_next: *const c_void, flags: u32,
+        queue_create_info_count: u32, p_queue_create_infos: *const VkDeviceQueueCreateInfo,
+        enabled_layer_count: u32, pp_enabled_layer_names: *const *const c_char,
+        enabled_ext_count: u32, pp_enabled_ext_names: *const *const c_char,
+        p_enabled_features: *const c_void,
+    }
+    #[repr(C)]
+    struct VkExportMemoryAllocateInfo {
+        s_type: u32, p_next: *const c_void, handle_types: u32,
+    }
+    #[repr(C)]
+    struct VkImportMemoryFdInfoKHR {
+        s_type: u32, p_next: *const c_void, handle_type: u32, fd: i32,
+    }
+    #[repr(C)]
+    struct VkMemoryAllocateInfo {
+        s_type: u32, p_next: *const c_void,
+        allocation_size: u64, memory_type_index: u32,
+    }
+    #[repr(C)]
+    struct VkMemoryFdPropertiesKHR {
+        s_type: u32, p_next: *mut c_void, memory_type_bits: u32,
+    }
+    #[repr(C)]
+    struct VkMemoryGetFdInfoKHR {
+        s_type: u32, p_next: *const c_void,
+        memory: VkDeviceMemory, handle_type: u32,
+    }
+
+    // Function pointer types
+    type GetInstanceProcAddrFn = unsafe extern "C" fn(VkInstance, *const c_char) -> *const c_void;
+    type CreateInstanceFn = unsafe extern "C" fn(*const VkInstanceCreateInfo, *const c_void, *mut VkInstance) -> i32;
+    type EnumPhysDevsFn = unsafe extern "C" fn(VkInstance, *mut u32, *mut VkPhysicalDevice) -> i32;
+    type CreateDeviceFn = unsafe extern "C" fn(VkPhysicalDevice, *const VkDeviceCreateInfo, *const c_void, *mut VkDevice) -> i32;
+    type AllocMemFn = unsafe extern "C" fn(VkDevice, *const VkMemoryAllocateInfo, *const c_void, *mut VkDeviceMemory) -> i32;
+    type FreeMemFn = unsafe extern "C" fn(VkDevice, VkDeviceMemory, *const c_void);
+    type GetMemFdPropsFn = unsafe extern "C" fn(VkDevice, u32, i32, *mut VkMemoryFdPropertiesKHR) -> i32;
+    type GetMemFdFn = unsafe extern "C" fn(VkDevice, *const VkMemoryGetFdInfoKHR, *mut i32) -> i32;
+
+    // Vulkan handles are thread-safe (the API is designed for multi-threaded use)
+    unsafe impl Send for VulkanBridge {}
+    unsafe impl Sync for VulkanBridge {}
+
+    pub(super) struct VulkanBridge {
+        device: VkDevice,
+        alloc_memory: AllocMemFn,
+        free_memory: FreeMemFn,
+        get_mem_fd_props: GetMemFdPropsFn,
+        get_mem_fd: GetMemFdFn,
+        memory_type_index: u32, // cached from first successful query
+    }
+
+    static BRIDGE: OnceLock<Option<VulkanBridge>> = OnceLock::new();
+
+    pub(super) fn vulkan_bridge() -> Option<&'static VulkanBridge> {
+        BRIDGE.get_or_init(|| {
+            unsafe { init_vulkan_bridge() }
+        }).as_ref()
+    }
+
+    unsafe fn init_vulkan_bridge() -> Option<VulkanBridge> {
+        let lib = libloading::Library::new("libvulkan.so").ok()?;
+        let get_inst_proc: libloading::Symbol<GetInstanceProcAddrFn> =
+            lib.get(b"vkGetInstanceProcAddr").ok()?;
+
+        let get_fn = |inst: VkInstance, name: &str| -> *const c_void {
+            let c = CString::new(name).ok();
+            c.map(|n| unsafe { (*get_inst_proc)(inst, n.as_ptr()) }).unwrap_or(std::ptr::null())
+        };
+
+        // Create instance
+        let create_inst: CreateInstanceFn = std::mem::transmute(get_fn(std::ptr::null_mut(), "vkCreateInstance"));
+        let app_name = CString::new("smithay-vk-bridge").ok()?;
+        let app_info = VkApplicationInfo {
+            s_type: VK_STRUCTURE_TYPE_APPLICATION_INFO, p_next: std::ptr::null(),
+            p_app_name: app_name.as_ptr(), app_version: 0,
+            p_engine_name: std::ptr::null(), engine_version: 0,
+            api_version: VK_API_VERSION_1_1,
+        };
+        let inst_info = VkInstanceCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, p_next: std::ptr::null(),
+            flags: 0, p_app_info: &app_info,
+            enabled_layer_count: 0, pp_enabled_layer_names: std::ptr::null(),
+            enabled_ext_count: 0, pp_enabled_ext_names: std::ptr::null(),
+        };
+        let mut instance: VkInstance = std::ptr::null_mut();
+        if create_inst(&inst_info, std::ptr::null(), &mut instance) != VK_SUCCESS {
+            tracing::warn!("Vulkan bridge: vkCreateInstance failed");
+            return None;
+        }
+
+        // Get physical device
+        let enum_devs: EnumPhysDevsFn = std::mem::transmute(get_fn(instance, "vkEnumeratePhysicalDevices"));
+        let mut count: u32 = 1;
+        let mut gpu: VkPhysicalDevice = std::ptr::null_mut();
+        enum_devs(instance, &mut count, &mut gpu);
+        if gpu.is_null() { return None; }
+
+        // Create device
+        let create_dev: CreateDeviceFn = std::mem::transmute(get_fn(instance, "vkCreateDevice"));
+        let ext1 = CString::new("VK_KHR_external_memory").ok()?;
+        let ext2 = CString::new("VK_KHR_external_memory_fd").ok()?;
+        let ext_ptrs = [ext1.as_ptr(), ext2.as_ptr()];
+        let priority: f32 = 1.0;
+        let queue_info = VkDeviceQueueCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, p_next: std::ptr::null(),
+            flags: 0, queue_family_index: 0, queue_count: 1, p_queue_priorities: &priority,
+        };
+        let dev_info = VkDeviceCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, p_next: std::ptr::null(),
+            flags: 0, queue_create_info_count: 1, p_queue_create_infos: &queue_info,
+            enabled_layer_count: 0, pp_enabled_layer_names: std::ptr::null(),
+            enabled_ext_count: 2, pp_enabled_ext_names: ext_ptrs.as_ptr(),
+            p_enabled_features: std::ptr::null(),
+        };
+        let mut device: VkDevice = std::ptr::null_mut();
+        if create_dev(gpu, &dev_info, std::ptr::null(), &mut device) != VK_SUCCESS {
+            tracing::warn!("Vulkan bridge: vkCreateDevice failed");
+            return None;
+        }
+
+        // Get device-level function pointers
+        let get_dev_fn = |name: &str| -> *const c_void {
+            let get_dev_proc: unsafe extern "C" fn(VkDevice, *const c_char) -> *const c_void =
+                std::mem::transmute(get_fn(instance, "vkGetDeviceProcAddr"));
+            let c = CString::new(name).ok();
+            c.map(|n| unsafe { get_dev_proc(device, n.as_ptr()) }).unwrap_or(std::ptr::null())
+        };
+
+        let alloc_memory: AllocMemFn = std::mem::transmute(get_dev_fn("vkAllocateMemory"));
+        let free_memory: FreeMemFn = std::mem::transmute(get_dev_fn("vkFreeMemory"));
+        let get_mem_fd_props: GetMemFdPropsFn = std::mem::transmute(get_dev_fn("vkGetMemoryFdPropertiesKHR"));
+        let get_mem_fd: GetMemFdFn = std::mem::transmute(get_dev_fn("vkGetMemoryFdKHR"));
+
+        // Leak the library so function pointers stay valid
+        std::mem::forget(lib);
+
+        tracing::info!("Vulkan bridge initialized (proprietary Qualcomm driver)");
+        Some(VulkanBridge {
+            device, alloc_memory, free_memory, get_mem_fd_props, get_mem_fd,
+            memory_type_index: 1, // default, will be validated on first use
+        })
+    }
+
+    impl VulkanBridge {
+        /// Convert a KGSL dmabuf fd into an opaque fd via the proprietary Vulkan driver.
+        /// The caller must close the returned fd when done.
+        pub(super) fn dmabuf_to_opaque_fd(&self, dmabuf_fd: i32, size: u64) -> Option<i32> {
+            unsafe {
+                // Query memory type for this dmabuf
+                let mut fd_props = VkMemoryFdPropertiesKHR {
+                    s_type: VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+                    p_next: std::ptr::null_mut(), memory_type_bits: 0,
+                };
+                let dup_fd = libc::dup(dmabuf_fd);
+                if dup_fd < 0 { return None; }
+
+                let res = (self.get_mem_fd_props)(self.device,
+                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup_fd, &mut fd_props);
+                if res != VK_SUCCESS || fd_props.memory_type_bits == 0 {
+                    libc::close(dup_fd);
+                    return None;
+                }
+
+                // Find first set bit in memory_type_bits
+                let mem_type_idx = fd_props.memory_type_bits.trailing_zeros();
+
+                // Import dmabuf + enable opaque fd export
+                let import_info = VkImportMemoryFdInfoKHR {
+                    s_type: VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    handle_type: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                    fd: dup_fd, // Vulkan takes ownership
+                };
+                let export_info = VkExportMemoryAllocateInfo {
+                    s_type: VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                    p_next: &import_info as *const _ as *const c_void,
+                    handle_types: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+                };
+                let alloc_info = VkMemoryAllocateInfo {
+                    s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                    p_next: &export_info as *const _ as *const c_void,
+                    allocation_size: size,
+                    memory_type_index: mem_type_idx,
+                };
+                let mut memory: VkDeviceMemory = 0;
+                let res = (self.alloc_memory)(self.device, &alloc_info, std::ptr::null(), &mut memory);
+                if res != VK_SUCCESS {
+                    return None;
+                }
+
+                // Export as opaque fd
+                let get_fd_info = VkMemoryGetFdInfoKHR {
+                    s_type: VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+                    p_next: std::ptr::null(),
+                    memory,
+                    handle_type: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+                };
+                let mut opaque_fd: i32 = -1;
+                let res = (self.get_mem_fd)(self.device, &get_fd_info, &mut opaque_fd);
+
+                // Free the VkDeviceMemory (opaque fd keeps a reference)
+                (self.free_memory)(self.device, memory, std::ptr::null());
+
+                if res != VK_SUCCESS || opaque_fd < 0 {
+                    return None;
+                }
+
+                Some(opaque_fd)
+            }
+        }
     }
 }
 
@@ -1452,10 +1729,13 @@ impl ImportDma for GlesRenderer {
                             }
                         }
                     }
-                    // GL_EXT_memory_object_fd: DMA_BUF import succeeds but
-                    // glTexStorageMem2DEXT fails on Qualcomm (GL_INVALID_VALUE).
-                    // Disabled for now — see import_dmabuf_via_memory_object().
-                    //
+                    // Try GL_EXT_memory_object_fd with Vulkan bridge (dmabuf→opaque fd).
+                    match self.import_dmabuf_via_memory_object(buffer) {
+                        Ok(tex) => return Ok(tex),
+                        Err(memobj_err) => {
+                            warn!("GL memory object import failed: {memobj_err}, falling back to mmap");
+                        }
+                    }
                     // Final fallback: mmap + glTexSubImage2D (CPU copy).
                     self.import_dmabuf_via_mmap(buffer)
                 }
@@ -1541,12 +1821,31 @@ impl GlesRenderer {
         info!("GL memobj: trying {}x{} {:?} modifier={:?} stride={} offset={} buf_size={} fd={}",
               w, h, fourcc, modifier, stride, offset, buf_size, fd.as_raw_fd());
 
-        // dup the fd — GL takes ownership
-        let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
-        if dup_fd < 0 {
-            warn!("GL memobj: dup failed");
-            return Err(GlesError::MappingError);
-        }
+        // Convert dmabuf fd to opaque fd via Vulkan bridge (if available)
+        #[cfg(target_os = "android")]
+        let import_fd = {
+            if let Some(bridge) = vulkan_bridge::vulkan_bridge() {
+                if let Some(opaque_fd) = bridge.dmabuf_to_opaque_fd(fd.as_raw_fd(), buf_size) {
+                    info!("GL memobj: Vulkan bridge converted dmabuf to opaque fd={}", opaque_fd);
+                    opaque_fd
+                } else {
+                    warn!("GL memobj: Vulkan bridge failed, using raw dmabuf fd");
+                    let d = unsafe { libc::dup(fd.as_raw_fd()) };
+                    if d < 0 { return Err(GlesError::MappingError); }
+                    d
+                }
+            } else {
+                let d = unsafe { libc::dup(fd.as_raw_fd()) };
+                if d < 0 { return Err(GlesError::MappingError); }
+                d
+            }
+        };
+        #[cfg(not(target_os = "android"))]
+        let import_fd = {
+            let d = unsafe { libc::dup(fd.as_raw_fd()) };
+            if d < 0 { return Err(GlesError::MappingError); }
+            d
+        };
 
         unsafe {
             self.egl.make_current()?;
@@ -1554,30 +1853,37 @@ impl GlesRenderer {
             // Create memory object
             let mut mem_obj: u32 = 0;
             (funcs.create)(1, &mut mem_obj);
+            info!("GL memobj: created mem_obj={}", mem_obj);
 
-            // Try DMA_BUF_FD first (correct type for dmabufs), then OPAQUE_FD
-            (funcs.import_fd)(mem_obj, buf_size, HANDLE_TYPE_DMA_BUF_FD_EXT, dup_fd);
-            let err = self.gl.GetError();
-            if err != ffi::NO_ERROR {
-                info!("GL memobj: DMA_BUF_FD import err={:#x}, trying OPAQUE_FD", err);
-                let dup_fd2 = libc::dup(fd.as_raw_fd());
-                if dup_fd2 >= 0 {
-                    (funcs.import_fd)(mem_obj, buf_size, HANDLE_TYPE_OPAQUE_FD_EXT, dup_fd2);
-                    let err2 = self.gl.GetError();
-                    if err2 != ffi::NO_ERROR {
-                        (funcs.delete)(1, &mem_obj);
-                        warn!("GL memory object import failed (DMA_BUF err={:#x}, OPAQUE err={:#x})", err, err2);
-                        return Err(GlesError::MappingError);
-                    }
-                } else {
-                    (funcs.delete)(1, &mem_obj);
-                    return Err(GlesError::MappingError);
-                }
-            } else {
-                info!("GL memobj: DMA_BUF_FD import succeeded");
+            // Check if it's valid
+            if let Some(is_obj) = funcs.is_mem_obj {
+                info!("GL memobj: isMemoryObject={}", is_obj(mem_obj));
             }
 
-            // Create texture and bind memory object to it
+            // Import the fd (opaque if Vulkan bridge succeeded, raw dmabuf otherwise)
+            (funcs.import_fd)(mem_obj, buf_size, HANDLE_TYPE_OPAQUE_FD_EXT, import_fd);
+            let err = self.gl.GetError();
+            if err != ffi::NO_ERROR {
+                (funcs.delete)(1, &mem_obj);
+                warn!("GL memory object import failed: err={:#x}", err);
+                return Err(GlesError::MappingError);
+            }
+            info!("GL memobj: import succeeded, mem_obj={}", mem_obj);
+
+            // Check validity after import
+            if let Some(is_obj) = funcs.is_mem_obj {
+                info!("GL memobj: isMemoryObject after import={}", is_obj(mem_obj));
+            }
+
+            // Try setting dedicated memory flag
+            if let Some(param) = funcs.mem_obj_param {
+                let one: i32 = 1;
+                param(mem_obj, DEDICATED_MEMORY_OBJECT_EXT, &one);
+                let ded_err = self.gl.GetError();
+                info!("GL memobj: set DEDICATED err={:#x}", ded_err);
+            }
+
+            // Create texture and try multiple formats
             let mut tex: u32 = 0;
             self.gl.GenTextures(1, &mut tex);
             self.gl.BindTexture(ffi::TEXTURE_2D, tex);
@@ -1586,14 +1892,56 @@ impl GlesRenderer {
             self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
             self.gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
 
-            (funcs.tex_storage_mem_2d)(ffi::TEXTURE_2D, 1, gl_internal, w, h, mem_obj, offset);
+            // Try RGBA8 first
+            (funcs.tex_storage_mem_2d)(ffi::TEXTURE_2D, 1, ffi::RGBA8, w, h, mem_obj, offset);
             let tex_err = self.gl.GetError();
-            if tex_err != ffi::NO_ERROR {
+            if tex_err == ffi::NO_ERROR {
+                info!("GL memobj: glTexStorageMem2DEXT(RGBA8) SUCCEEDED!");
+            } else {
+                warn!("GL memobj: RGBA8 err={:#x}, trying RGB8...", tex_err);
+                // Need a fresh texture for each attempt
                 self.gl.DeleteTextures(1, &tex);
-                (funcs.delete)(1, &mem_obj);
-                warn!("glTexStorageMem2DEXT failed: err={:#x}", tex_err);
-                return Err(GlesError::MappingError);
+                self.gl.GenTextures(1, &mut tex);
+                self.gl.BindTexture(ffi::TEXTURE_2D, tex);
+
+                (funcs.tex_storage_mem_2d)(ffi::TEXTURE_2D, 1, ffi::RGB8, w, h, mem_obj, offset);
+                let err2 = self.gl.GetError();
+                if err2 == ffi::NO_ERROR {
+                    info!("GL memobj: glTexStorageMem2DEXT(RGB8) SUCCEEDED!");
+                } else {
+                    warn!("GL memobj: RGB8 err={:#x}, trying RGBA w=stride...", err2);
+                    self.gl.DeleteTextures(1, &tex);
+                    self.gl.GenTextures(1, &mut tex);
+                    self.gl.BindTexture(ffi::TEXTURE_2D, tex);
+
+                    // Try with stride-based width
+                    let stride_w = (stride / 4) as i32;
+                    (funcs.tex_storage_mem_2d)(ffi::TEXTURE_2D, 1, ffi::RGBA8, stride_w, h, mem_obj, offset);
+                    let err3 = self.gl.GetError();
+                    if err3 == ffi::NO_ERROR {
+                        info!("GL memobj: glTexStorageMem2DEXT(RGBA8, stride_w={}) SUCCEEDED!", stride_w);
+                    } else {
+                        warn!("GL memobj: stride_w err={:#x}, trying 1x1...", err3);
+                        self.gl.DeleteTextures(1, &tex);
+                        self.gl.GenTextures(1, &mut tex);
+                        self.gl.BindTexture(ffi::TEXTURE_2D, tex);
+
+                        // Try trivial 1x1 to see if the function works at ALL
+                        (funcs.tex_storage_mem_2d)(ffi::TEXTURE_2D, 1, ffi::RGBA8, 1, 1, mem_obj, 0);
+                        let err4 = self.gl.GetError();
+                        if err4 == ffi::NO_ERROR {
+                            info!("GL memobj: 1x1 SUCCEEDED! Size mismatch issue");
+                        } else {
+                            warn!("GL memobj: even 1x1 failed err={:#x}. Function is broken on this driver.", err4);
+                            self.gl.DeleteTextures(1, &tex);
+                            (funcs.delete)(1, &mem_obj);
+                            return Err(GlesError::MappingError);
+                        }
+                    }
+                }
             }
+
+            let tex_err = self.gl.GetError(); // drain any residual
 
             self.gl.BindTexture(ffi::TEXTURE_2D, 0);
 
