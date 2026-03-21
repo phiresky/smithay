@@ -1288,6 +1288,7 @@ mod android_ahb {
     // AHardwareBuffer format constants (= HAL_PIXEL_FORMAT_*)
     pub const AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM: u32 = 1;  // RGBA
     pub const AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM: u32 = 2;  // RGBX
+    #[allow(dead_code)]
     pub const AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM: u32 = 3;    // RGB
     pub const AHARDWAREBUFFER_FORMAT_BGRA_8888: u32 = 5;       // HAL_PIXEL_FORMAT_BGRA_8888
 
@@ -1316,9 +1317,9 @@ mod android_ahb {
     pub fn ahb_functions() -> Option<&'static AhbFunctions> {
         AHB_FUNCTIONS.get_or_init(|| {
             let lib = unsafe { libloading::Library::new("libnativewindow.so") }.ok()?;
-            let create_from_handle: libloading::Symbol<CreateFromHandleFn> =
+            let create_from_handle: libloading::Symbol<'_, CreateFromHandleFn> =
                 unsafe { lib.get(b"AHardwareBuffer_createFromHandle") }.ok()?;
-            let release: libloading::Symbol<ReleaseFn> =
+            let release: libloading::Symbol<'_, ReleaseFn> =
                 unsafe { lib.get(b"AHardwareBuffer_release") }.ok()?;
             let funcs = AhbFunctions {
                 create_from_handle: *create_from_handle,
@@ -1508,7 +1509,6 @@ mod vulkan_bridge {
         free_memory: FreeMemFn,
         get_mem_fd_props: GetMemFdPropsFn,
         get_mem_fd: GetMemFdFn,
-        memory_type_index: u32, // cached from first successful query
     }
 
     static BRIDGE: OnceLock<Option<VulkanBridge>> = OnceLock::new();
@@ -1521,7 +1521,7 @@ mod vulkan_bridge {
 
     unsafe fn init_vulkan_bridge() -> Option<VulkanBridge> {
         let lib = libloading::Library::new("libvulkan.so").ok()?;
-        let get_inst_proc: libloading::Symbol<GetInstanceProcAddrFn> =
+        let get_inst_proc: libloading::Symbol<'_, GetInstanceProcAddrFn> =
             lib.get(b"vkGetInstanceProcAddr").ok()?;
 
         let get_fn = |inst: VkInstance, name: &str| -> *const c_void {
@@ -1599,7 +1599,6 @@ mod vulkan_bridge {
         tracing::info!("Vulkan bridge initialized (proprietary Qualcomm driver)");
         Some(VulkanBridge {
             device, alloc_memory, free_memory, get_mem_fd_props, get_mem_fd,
-            memory_type_index: 1, // default, will be validated on first use
         })
     }
 
@@ -1941,7 +1940,7 @@ impl GlesRenderer {
                 }
             }
 
-            let tex_err = self.gl.GetError(); // drain any residual
+            let _tex_err = self.gl.GetError(); // drain any residual
 
             self.gl.BindTexture(ffi::TEXTURE_2D, 0);
 
